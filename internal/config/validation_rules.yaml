@@ -1,0 +1,197 @@
+#  ____        _        ____             __ _
+# |  _ \ _   _| | ___  / ___|___  _ __  / _(_) __ _
+# | |_) | | | | |/ _ \| |   / _ \| '_ \| |_| |/ _` |
+# |  _ <| |_| | |  __/| |__| (_) | | | |  _| | (_| |
+# |_| \_\\__,_|_|\___| \____\___/|_| |_|_| |_|\__, |
+#                                               |___/
+#
+# Validation Levels:
+#   ignore  — skip all validation (health checks, public probes)
+#   lenient — validate declared constraints; missing API version is allowed
+#   strict  — version header required; all declared constraints enforced
+#
+# Routes without a version prefix (/me/*, /orders/*) use "lenient".
+# Upgrade individual routes to "strict" once API versioning is introduced.
+#
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------------
+  "/health":
+    GET:
+      level: "ignore"
+
+  # ---------------------------------------------------------------------------
+  # User orders — /me/orders
+  # ---------------------------------------------------------------------------
+  "/me/orders":
+    GET:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+
+    POST:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+        Content-Type:
+          required: true
+          value: "application/json"
+      body:
+        items:
+          type: "array"
+          required: true
+        address_id:
+          type: "string"
+          required: true
+        payment_method_id:
+          type: "string"
+          required: true
+
+  "/me/orders/{orderId}":
+    GET:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+      params:
+        orderId:
+          type: "string"
+          required: true
+
+    DELETE:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+      params:
+        orderId:
+          type: "string"
+          required: true
+
+  # ---------------------------------------------------------------------------
+  # Internal orders — /orders (service-to-service, internal JWT)
+  # ---------------------------------------------------------------------------
+  "/orders/{orderId}":
+    GET:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+      params:
+        orderId:
+          type: "string"
+          required: true
+
+    PUT:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+        Content-Type:
+          required: true
+          value: "application/json"
+      params:
+        orderId:
+          type: "string"
+          required: true
+      body:
+        status:
+          type: "string"
+          required: true
+
+  # ---------------------------------------------------------------------------
+  # User returns — /me/returns
+  # ---------------------------------------------------------------------------
+  "/me/returns":
+    GET:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+
+    POST:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+        Content-Type:
+          required: true
+          value: "application/json"
+      body:
+        order_id:
+          type: "string"
+          required: true
+        items:
+          type: "array"
+          required: true
+        reason:
+          type: "string"
+          required: true
+
+  "/me/returns/{returnId}":
+    GET:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+      params:
+        returnId:
+          type: "string"
+          required: true
+
+  # ---------------------------------------------------------------------------
+  # User exchanges — /me/exchanges
+  # ---------------------------------------------------------------------------
+  "/me/exchanges":
+    GET:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+
+    POST:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+        Content-Type:
+          required: true
+          value: "application/json"
+      body:
+        order_id:
+          type: "string"
+          required: true
+        return_items:
+          type: "array"
+          required: true
+        exchange_items:
+          type: "array"
+          required: true
+
+  "/me/exchanges/{exchangeId}":
+    GET:
+      level: "lenient"
+      headers:
+        Authorization:
+          required: true
+          value: "Bearer *"
+      params:
+        exchangeId:
+          type: "string"
+          required: true

@@ -1,0 +1,697 @@
+openapi: "3.1.0"
+info:
+  title: komodo-order-api
+  version: "0.1.0"
+  description: |
+    Order management service. Consumes cart checkout tokens to create and manage
+    customer orders. Writes to DynamoDB with a GSI for user-scoped listing.
+
+    **Two servers:**
+    - Public (7061): customer-facing order submission and lookup
+    - Internal (7062): service-to-service return state transitions (approve / reject / receive)
+
+    **HTTP conventions:**
+    - POST → 201 Created / 400 Bad Request / 409 Conflict
+    - PUT → 200 OK / 404 Not Found
+    - DELETE → 204 No Content / 404 Not Found
+    - GET → 200 OK / 404 Not Found
+
+servers:
+  - url: http://localhost:7061
+    description: Public (local)
+  - url: http://localhost:7062
+    description: Internal (local)
+
+tags:
+  - name: Health
+  - name: Orders
+  - name: Returns
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness check
+      operationId: healthCheck
+      security: []
+      responses:
+        "200":
+          description: Service is healthy
+
+  # ── Public order routes (7061) ─────────────────────────────────────────────
+
+  /v1/orders:
+    post:
+      tags: [Orders]
+      summary: Place order (unified — guest or authenticated)
+      operationId: placeOrderUnified
+      x-visibility: public
+      security: []
+      description: |
+        Unified order submission route that accepts both authenticated and guest
+        callers. Email is the universal identity key.
+
+        - **Authenticated caller (JWT present):** userID is taken from the JWT;
+          email in the request body is ignored. The order is linked to `USER#<userId>`.
+        - **Guest caller (no JWT):** `email` is required in the request body. At
+          placement, the email is looked up in user-api. If a registered account
+          exists, the order is linked to `USER#<userId>` and an "order added to
+          your account" notification is queued. Otherwise the order is keyed as
+          `GUEST#<uuid>`.
+
+        Idempotent — duplicate requests with the same `checkoutToken` return the
+        original order (Redis-backed, 24h TTL).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UnifiedPlaceOrderRequest"
+      responses:
+        "201":
+          description: Order created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Checkout token already used or order already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    get:
+      tags: [Orders]
+      summary: List orders for the authenticated user
+      operationId: listOrders
+      x-visibility: public
+      description: |
+        Returns a paginated list of orders for the authenticated user, newest first.
+        Uses cursor-based pagination — pass the `nextCursor` value from the previous
+        response as the `cursor` parameter to fetch the next page.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque continuation token from a previous response
+      responses:
+        "200":
+          description: Paginated order list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/orders/{orderId}:
+    get:
+      tags: [Orders]
+      summary: Get order (guest-compatible)
+      operationId: getOrderUnified
+      x-visibility: public
+      security: []
+      description: |
+        Retrieves a single order by ID. Supports both authenticated and guest access.
+
+        **Authenticated (JWT present):** ownership is validated via the user ID in the token.
+        The stored UserID may be prefixed as `USER#<uuid>` for registered users — both
+        forms are accepted.
+
+        **Guest (no JWT):** the `email` query parameter is required and must match the
+        email stored on the order (case-insensitive). Any mismatch returns 404 to prevent
+        order ID enumeration.
+
+        Designed for confirmation email deep links: `GET /v1/orders/{orderId}?email=<email>`
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: email
+          in: query
+          required: false
+          description: Required when no JWT is provided. Must match the email on the order.
+          schema:
+            type: string
+            format: email
+      responses:
+        "200":
+          description: Order detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/orders/{orderId}/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel order
+      operationId: cancelOrder
+      x-visibility: public
+      description: |
+        Cancels an order. Only orders in `pending` or `confirmed` status are
+        eligible — attempting to cancel a shipped or delivered order returns 409.
+        Returns the updated order on success.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Order cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Order cannot be cancelled (already cancelled, shipped, or delivered)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Returns — public (7061) ────────────────────────────────────────────────
+
+  /v1/orders/returns:
+    get:
+      tags: [Returns]
+      summary: List user's return requests
+      operationId: listMyReturns
+      x-visibility: public
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/ReturnStatus"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Return requests
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReturnList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      tags: [Returns]
+      summary: Initiate a return request
+      operationId: createReturn
+      x-visibility: public
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateReturnRequest"
+      responses:
+        "201":
+          description: Return request created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Return"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Order not eligible for return (outside window, already returned, or not fulfilled)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/orders/returns/{returnId}:
+    get:
+      tags: [Returns]
+      summary: Get return status
+      operationId: getMyReturn
+      x-visibility: public
+      parameters:
+        - $ref: "#/components/parameters/ReturnId"
+      responses:
+        "200":
+          description: Return details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Return"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    delete:
+      tags: [Returns]
+      summary: Cancel a pending return request
+      operationId: cancelMyReturn
+      x-visibility: public
+      parameters:
+        - $ref: "#/components/parameters/ReturnId"
+      responses:
+        "204":
+          description: Return cancelled
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Return cannot be cancelled (already approved or processed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Returns — private (7062, service-to-service, scope-checked JWT) ────────
+
+  /v1/returns/{returnId}/approve:
+    put:
+      tags: [Returns]
+      summary: Approve return and trigger refund
+      operationId: approveReturn
+      x-visibility: private
+      parameters:
+        - $ref: "#/components/parameters/ReturnId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApproveReturnRequest"
+      responses:
+        "200":
+          description: Return approved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Return"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Return not in approvable state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/returns/{returnId}/reject:
+    put:
+      tags: [Returns]
+      summary: Reject return request
+      operationId: rejectReturn
+      x-visibility: private
+      parameters:
+        - $ref: "#/components/parameters/ReturnId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectReturnRequest"
+      responses:
+        "200":
+          description: Return rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Return"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/returns/{returnId}/receive:
+    put:
+      tags: [Returns]
+      summary: Mark items received, trigger restock and loyalty reversal
+      operationId: receiveReturn
+      x-visibility: private
+      parameters:
+        - $ref: "#/components/parameters/ReturnId"
+      responses:
+        "200":
+          description: Return processed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Return"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Return not in receivable state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ReturnId:
+      name: returnId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    UnifiedPlaceOrderRequest:
+      type: object
+      required: [checkoutToken]
+      properties:
+        checkoutToken:
+          type: string
+          description: Checkout token issued by cart-api after /cart/checkout
+        email:
+          type: string
+          format: email
+          description: |
+            Required for guest callers (no JWT). Ignored when a valid JWT is
+            present — identity is taken from the token in that case.
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Internal order ID (UUID)
+        displayId:
+          type: string
+          description: Customer-facing order label
+        userId:
+          type: string
+          description: GSI key for the order owner. `USER#<id>` for registered accounts, `GUEST#<uuid>` for guests.
+        email:
+          type: string
+          format: email
+          description: Universal identity key; required for guest order lookup.
+        status:
+          type: string
+          enum: [pending, confirmed, processing, shipped, delivered, cancelled, refunded]
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderItem"
+        address:
+          $ref: "#/components/schemas/OrderAddress"
+        payment:
+          $ref: "#/components/schemas/OrderPayment"
+        totals:
+          $ref: "#/components/schemas/OrderTotals"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    OrderItem:
+      type: object
+      properties:
+        id:
+          type: string
+        productId:
+          type: string
+        variantId:
+          type: string
+        sku:
+          type: string
+        name:
+          type: string
+        quantity:
+          type: integer
+        unitPrice:
+          type: number
+          format: float
+        total:
+          type: number
+          format: float
+
+    OrderAddress:
+      type: object
+      properties:
+        line1:
+          type: string
+        line2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        postalCode:
+          type: string
+        country:
+          type: string
+
+    OrderPayment:
+      type: object
+      properties:
+        method:
+          type: string
+        transactionId:
+          type: string
+        amount:
+          type: number
+          format: float
+        currency:
+          type: string
+
+    OrderTotals:
+      type: object
+      properties:
+        subtotal:
+          type: number
+          format: float
+        tax:
+          type: number
+          format: float
+        shipping:
+          type: number
+          format: float
+        discount:
+          type: number
+          format: float
+        total:
+          type: number
+          format: float
+
+    OrderListResponse:
+      type: object
+      required: [orders]
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: "#/components/schemas/Order"
+        nextCursor:
+          type: string
+          description: Opaque pagination cursor; omitted when no further pages exist
+
+    ErrorResponse:
+      type: object
+      properties:
+        status:
+          type: integer
+        message:
+          type: string
+        code:
+          type: string
+        detail:
+          type: string
+        request_id:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    # ── Returns schemas ────────────────────────────────────────────────────────
+
+    ReturnStatus:
+      type: string
+      enum: [requested, approved, received, processed, rejected, cancelled]
+
+    ReturnItem:
+      type: object
+      required: [item_id, sku, quantity, reason]
+      properties:
+        item_id:
+          type: string
+        sku:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          enum: [defective, wrong_item, not_as_described, changed_mind, other]
+        notes:
+          type: string
+
+    Return:
+      type: object
+      required: [return_id, order_id, status, items, created_at, updated_at]
+      properties:
+        return_id:
+          type: string
+          format: uuid
+        order_id:
+          type: string
+        status:
+          $ref: "#/components/schemas/ReturnStatus"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReturnItem"
+        refund_amount_cents:
+          type: integer
+        refund_id:
+          type: string
+          description: Set when refund is initiated
+        return_window_expires:
+          type: string
+          format: date-time
+        rejection_reason:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    ReturnList:
+      type: object
+      required: [returns]
+      properties:
+        returns:
+          type: array
+          items:
+            $ref: "#/components/schemas/Return"
+        next_cursor:
+          type: string
+
+    CreateReturnRequest:
+      type: object
+      required: [order_id, items]
+      properties:
+        order_id:
+          type: string
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ReturnItem"
+
+    ApproveReturnRequest:
+      type: object
+      properties:
+        refund_amount_cents:
+          type: integer
+          description: Override refund amount. Defaults to full item value if omitted.
+
+    RejectReturnRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"

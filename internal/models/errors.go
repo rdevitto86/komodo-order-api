@@ -1,0 +1,50 @@
+package models
+
+import (
+	"errors"
+	"net/http"
+
+	httpErr "github.com/rdevitto86/komodo-forge-sdk-go/api/errors"
+)
+
+// ErrNotFound is returned when an order does not exist or is not visible to the caller.
+// Handlers map this to 404 — never 403, to avoid leaking order ID existence.
+var ErrNotFound = errors.New("not found")
+
+// ErrForbidden is a sentinel error for user-ownership violations.
+// Handlers map this to a 403 response via sendOrderError.
+var ErrForbidden = errors.New("forbidden")
+
+// ErrInvalidTransition is returned when a status update is rejected because the
+// stored status does not match the expected precondition (concurrent write guard).
+var ErrInvalidTransition = errors.New("invalid status transition")
+
+// ErrAlreadyCancelled is returned when cancellation is attempted on an order
+// that is already in the cancelled state.
+var ErrAlreadyCancelled = errors.New("already cancelled")
+
+// ErrNotCancellable is returned when cancellation is attempted on an order
+// whose current status does not permit it (e.g. shipped, delivered).
+var ErrNotCancellable = errors.New("not cancellable")
+
+// 40xxx — komodo-order-api orders (see forge-sdk ranges.go)
+// 41xxx — komodo-order-api line items
+type OrderAPIErrors struct {
+	NotFound          httpErr.ErrorCode
+	AlreadyCancelled  httpErr.ErrorCode
+	NotCancellable    httpErr.ErrorCode
+	InvalidTransition httpErr.ErrorCode
+	ItemNotFound      httpErr.ErrorCode
+	ItemUnavailable   httpErr.ErrorCode
+	InvalidQuantity   httpErr.ErrorCode
+}
+
+var Err = OrderAPIErrors{
+	NotFound:          httpErr.ErrorCode{ID: httpErr.CodeID(httpErr.RangeOrder, 1), Status: http.StatusNotFound, Message: "Order not found"},
+	AlreadyCancelled:  httpErr.ErrorCode{ID: httpErr.CodeID(httpErr.RangeOrder, 2), Status: http.StatusConflict, Message: "Order already cancelled"},
+	NotCancellable:    httpErr.ErrorCode{ID: httpErr.CodeID(httpErr.RangeOrder, 3), Status: http.StatusConflict, Message: "Order cannot be cancelled"},
+	InvalidTransition: httpErr.ErrorCode{ID: httpErr.CodeID(httpErr.RangeOrder, 4), Status: http.StatusConflict, Message: "Invalid order state transition"},
+	ItemNotFound:      httpErr.ErrorCode{ID: httpErr.CodeID(httpErr.RangeOrderItem, 1), Status: http.StatusNotFound, Message: "Order item not found"},
+	ItemUnavailable:   httpErr.ErrorCode{ID: httpErr.CodeID(httpErr.RangeOrderItem, 2), Status: http.StatusConflict, Message: "Item unavailable"},
+	InvalidQuantity:   httpErr.ErrorCode{ID: httpErr.CodeID(httpErr.RangeOrderItem, 3), Status: http.StatusBadRequest, Message: "Invalid quantity"},
+}

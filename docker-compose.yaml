@@ -1,0 +1,37 @@
+name: komodo-order-api
+
+services:
+  order-api:
+    image: komodo-order-api:${VERSION:-dev}
+    build:
+      context: ..
+      dockerfile: komodo-order-api/Dockerfile
+      args:
+        ENV: ${ENV:-local}
+    restart: ${RESTART_POLICY:-no}
+    deploy:
+      resources:
+        limits:
+          memory: ${MEM_LIMIT:-512M}
+    env_file:
+      - ../../infra/local/env.shared
+    environment:
+      APP_NAME: komodo-order-api
+      PORT: 7061
+      VERSION: ${VERSION:-dev}
+      EVAL_RULES_PATH: /app/config/validation_rules.yaml
+    ports:
+      - "7061:7061"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:7061/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    networks:
+      - komodo-network
+networks:
+  komodo-network:
+    external: true
